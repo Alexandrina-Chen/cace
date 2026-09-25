@@ -38,14 +38,14 @@ calculator = CACECalculator(model_path=cace_nnp,
                             compute_stress=False,
                            )
 
-init_conf.set_calculator(calculator)
+init_conf.calc = calculator
 
 from ase.md.velocitydistribution import MaxwellBoltzmannDistribution
 
 temperature = 300.0 # in K
 
 # Set initial velocities using Maxwell-Boltzmann distribution
-MaxwellBoltzmannDistribution(init_conf, temperature * units.kB)
+MaxwellBoltzmannDistribution(init_conf, temperature_K=temperature)
 
 
 def print_energy(a):

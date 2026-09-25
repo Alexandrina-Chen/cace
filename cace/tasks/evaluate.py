@@ -4,7 +4,11 @@ import torch
 from torch import nn
 
 from ase import Atoms
-from ase.io import read, write
+from ase.io import write
+from ase.calculators.calculator import all_properties
+from ase.calculators.singlepoint import SinglePointCalculator
+from ase.stress import full_3x3_to_voigt_6_stress
+from ..tools.output import batch_to_atoms
 
 from ..tools import torch_geometric, torch_tools, to_numpy
 from ..data import AtomicData
@@ -14,7 +18,7 @@ __all__ = ["EvaluateTask"]
 class EvaluateTask(nn.Module):
     """CACE Evaluator 
     args:
-        model_path: str, path to model
+        model_path: str, path to a trusted pickled model
         device: str, device to run on (cuda or cpu)
         energy_units_to_eV: float, conversion factor from model energy units to eV
         length_units_to_A: float, conversion factor from model length units to Angstroms
@@ -33,7 +37,7 @@ class EvaluateTask(nn.Module):
         energy_key: str = 'energy',
         forces_key: str = 'forces',
         stress_key: str = 'stress',
-        other_keys: list = [],
+        other_keys: list = None,
         atomic_energies: dict = None,
         data_key: dict = None,
         ):
@@ -41,7 +45,7 @@ class EvaluateTask(nn.Module):
         super().__init__()
 
         if isinstance(model_path, str):
-            self.model = torch.load(f=model_path, map_location=device)
+            self.model = torch.load(f=model_path, map_location=device, weights_only=False)
         elif isinstance(model_path, nn.Module):
             self.model = model_path
         else:
@@ -57,7 +61,7 @@ class EvaluateTask(nn.Module):
         self.energy_key = energy_key
         self.forces_key = forces_key
         self.stress_key = stress_key
-        self.other_keys = other_keys
+        self.other_keys = [] if other_keys is None else list(other_keys)
         self.data_key = data_key
 
         self.atomic_energies = atomic_energies
@@ -76,176 +80,90 @@ class EvaluateTask(nn.Module):
              batch_size: int, batch size
              compute_stress: bool, whether to compute stress
         """
-        # Collect data
-        energies_list = []
-        stresses_list = []
-        forces_list = []
-        other_outputs = {key: [] for key in self.other_keys}
-
-        # check the data type
-        if isinstance(data, torch_geometric.batch.Batch):
-            data.to(self.device)
-            output = self.model(data.to_dict(), training=True)
-            if self.energy_key in output:
-                energies_now = to_numpy(output[self.energy_key])
-                if self.atomic_energies is not None:
-                    e0_list = self._add_atomic_energies(data)
-                    if len(energies_now.shape) > 1:
-                        n_entry = energies_now.shape[1]
-                        e0_list = np.repeat(e0_list, n_entry).reshape(-1, n_entry) 
-                        energies_list.append(energies_now + e0_list)
-                    else:
-                        energies_list.append(energies_now)
-            if self.forces_key in output:
-                forces_list.append(to_numpy(output[self.forces_key]))
-            if compute_stress and self.stress_key in output:
-                stresses_list.append(to_numpy(output[self.stress_key]))
-            for key in self.other_keys:
-                if key in output:
-                    other_outputs[key].append(to_numpy(output[key]))
-
-        elif isinstance(data, Atoms):
-            data_loader = torch_geometric.dataloader.DataLoader(
-                dataset=[
-                        AtomicData.from_atoms(
-                        data, cutoff=self.cutoff,
-                        data_key=self.data_key
-                        )
-                ],
-                batch_size=1,
-                shuffle=False,
-                drop_last=False,
-            )
-            output = self.model(next(iter(data_loader)).to_dict(), training=True)
-            if self.energy_key in output:
-                energy = to_numpy(output[self.energy_key])
-                if self.atomic_energies is not None:
-                    atomic_numbers = data.get_atomic_numbers()
-                    energy += sum(self.atomic_energies.get(Z, 0) for Z in atomic_numbers)
-                energies_list.append(energy)
-            if self.forces_key in output:
-                forces_list.append(to_numpy(output[self.forces_key]))
-            if compute_stress and self.stress_key in output:
-                stresses_list.append(to_numpy(output[self.stress_key]))
-            for key in self.other_keys:
-                if key in output:
-                    other_outputs[key].append(to_numpy(output[key]))
-
-        # check if the data is a list of atoms
+        if xyz_output is not None and batch_size != 1:
+            raise ValueError("Batch size must be 1 to write xyz files")
+        originals = None
+        if isinstance(data, Atoms):
+            originals = [data]
         elif isinstance(data, list):
-            if not isinstance(data[0], Atoms):
-               raise ValueError("Input data must be a list of ASE Atoms objects")
-            data_loader = torch_geometric.dataloader.DataLoader(
-                dataset=[
-		    AtomicData.from_atoms(
-			atom, cutoff=self.cutoff,
-                        data_key=self.data_key
-		    )
-		    for atom in data
-		],
-		batch_size=batch_size,
-		shuffle=False,
-		drop_last=False,
-	    )
-            atomforces_list = []
-            for batch in data_loader:
-                batch.to(self.device)
-                output = self.model(batch.to_dict(), training=True)
-                if self.energy_key in output:
-                    energies_now = to_numpy(output[self.energy_key])
-                    if self.atomic_energies is not None:
-                        e0_list = self._add_atomic_energies(batch)
-                        if len(energies_now.shape) > 1:
-                            n_entry = energies_now.shape[1]
-                            e0_list = np.repeat(e0_list, n_entry).reshape(-1, n_entry) 
-                        energies_now += e0_list
-                    energies_list.append(energies_now)
+            if not data or not all(isinstance(a, Atoms) for a in data):
+                raise ValueError("Input data must be a nonempty list of ASE Atoms objects")
+            originals = data
 
-                if self.forces_key in output:
-                    forces_list.append(to_numpy(output[self.forces_key]))
-                    forces = np.split(
-                        to_numpy(output[self.forces_key]),
-                        indices_or_sections=batch.ptr[1:],
-                        axis=0,
-                    )
-                    atomforces_list.append(forces[:-1])
-                if compute_stress and self.stress_key in output:
-                    stresses_list.append(to_numpy(output[self.stress_key]))
-                for key in self.other_keys:
-                    if key in output:
-                        other_outputs[key].append(to_numpy(output[key]))
-
-            if xyz_output is not None and batch_size > 1:
-                raise ValueError("Batch size must be 1 to write xyz files")
-
-            atoms_list = []
-            # Store data in atoms objects
-            if xyz_output is not None and batch_size == 1:
-                for i in range(len(data)):
-                    atoms = data[i].copy()
-                    atoms.calc = None  # crucial
-                    if len(energies_list) >= 1:
-                        atoms.info[self.energy_key] = energies_list[i][0] * self.energy_units_to_eV
-                    if len(forces_list) >= 1:
-                        atoms.set_array(self.forces_key, forces_list[i] * self.energy_units_to_eV / self.length_units_to_A)
-                    for key in self.other_keys:
-                        output_now = other_outputs[key][i]
-                        if output_now.ndim > 2 and output_now.shape[0] == 1:
-                            output_now = output_now[0]
-                        if output_now.ndim > 2:
-                            output_now = output_now.reshape(output_now.shape[0], -1)
-                        # is complex
-                        if np.iscomplexobj(output_now):
-                            if output_now.shape[0] == len(atoms.get_positions()):
-                                atoms.set_array(key+'_real', output_now.real)
-                                atoms.set_array(key+'_imag', output_now.imag)
-                            else:
-                                atoms.info[key+'_real'] = output_now.real
-                                atoms.info[key+'_imag'] = output_now.imag
-                        else:
-                            if output_now.shape[0] == len(atoms.get_positions()):
-                                atoms.set_array(key, output_now)
-                            else:
-                                atoms.info[key] = output_now
-                    if compute_stress:
-                        atoms.info[self.stress_key] = stresses_list[i]
-                    atoms_list.append(atoms)
-      	 	    # Write atoms to output path
-            write(xyz_output, atoms_list, format="extxyz", append=False)
-
+        if originals is not None:
+            batches = torch_geometric.dataloader.DataLoader(
+                [AtomicData.from_atoms(a, cutoff=self.cutoff, data_key=self.data_key)
+                 for a in originals], batch_size=batch_size, shuffle=False)
+        elif isinstance(data, torch_geometric.batch.Batch):
+            batches = [data]
         elif isinstance(data, torch_geometric.dataloader.DataLoader):
-            for batch in data:
-                batch.to(self.device)
-                output = self.model(batch.to_dict(), training=True)
-                if self.energy_key in output:
-                    energies_now = to_numpy(output[self.energy_key])
-                    if self.atomic_energies is not None:
-                        e0_list = self._add_atomic_energies(batch)
-                        if len(energies_now.shape) > 1:
-                            n_entry = energies_now.shape[1]
-                            e0_list = np.repeat(e0_list, n_entry).reshape(-1, n_entry) 
-                        energies_list.append(energies_now + e0_list)
-                    else:
-                        energies_list.append(energies_now)
-
-                if self.forces_key in output:
-                    forces_list.append(to_numpy(output[self.forces_key]))
-                if compute_stress and self.stress_key in output:
-                    stresses_list.append(to_numpy(output[self.stress_key]))
-                for key in self.other_keys:
-                    if key in output:
-                        other_outputs[key].append(to_numpy(output[key]))
+            batches = data
         else:
             raise ValueError("Input data type not recognized")
 
-        results = {
-            "energy": None if len(energies_list) == 0 else np.concatenate(energies_list) * self.energy_units_to_eV,
-            "forces": None if len(forces_list) == 0 else np.vstack(forces_list) * self.energy_units_to_eV / self.length_units_to_A,
-            "stress": None if len(stresses_list) == 0 else np.concatenate(stresses_list) * self.energy_units_to_eV / self.length_units_to_A ** 3,
-	}
-        for key in self.other_keys:
-            results[key] = np.concatenate(other_outputs[key])
-        return results
+        collected = {key: [] for key in ('energy', 'forces', 'stress', *self.other_keys)}
+        atoms_list = []
+        for source_batch in batches:
+            batch = source_batch.clone().to(self.device)
+            if xyz_output is not None and len(batch.ptr) != 2:
+                raise ValueError("Batch size must be 1 to write xyz files")
+            output = self.model(batch.to_dict(), training=True, compute_stress=compute_stress)
+            converted = {}
+            for name, key, factor in (
+                ('energy', self.energy_key, self.energy_units_to_eV),
+                ('forces', self.forces_key, self.energy_units_to_eV / self.length_units_to_A),
+                ('stress', self.stress_key, self.energy_units_to_eV / self.length_units_to_A**3),
+            ):
+                value = output.get(key)
+                if value is None or (name == 'stress' and not compute_stress):
+                    continue
+                value = np.array(to_numpy(value), copy=True)
+                if name == 'energy':
+                    value = np.atleast_1d(value)
+                    if self.atomic_energies is not None:
+                        offset = self._add_atomic_energies(batch)
+                        value += offset.reshape((-1,) + (1,) * (value.ndim - 1))
+                converted[name] = value * factor
+                collected[name].append(converted[name])
+            for key in self.other_keys:
+                if output.get(key) is not None:
+                    converted[key] = np.atleast_1d(to_numpy(output[key]))
+                    collected[key].append(converted[key])
+
+            if xyz_output is not None:
+                if originals is not None:
+                    original = originals[len(atoms_list)]
+                else:
+                    # Graphs lack original partial-PBC metadata (see batch_to_atoms).
+                    original = batch_to_atoms(source_batch)[0]
+                    if source_batch['stress'] is not None:
+                        original.info['stress'] = to_numpy(source_batch.stress)[0]
+                info, arrays = {}, {}
+                if 'energy' in converted:
+                    info[self.energy_key] = converted['energy'][0]
+                if 'forces' in converted:
+                    arrays[self.forces_key] = converted['forces']
+                if 'stress' in converted:
+                    info[self.stress_key] = converted['stress'][0]
+                for key in self.other_keys:
+                    if key not in converted:
+                        continue
+                    value = converted[key]
+                    if value.ndim > 2 and value.shape[0] == 1:
+                        value = value[0]
+                    if value.ndim > 2:
+                        value = value.reshape(value.shape[0], -1)
+                    target = arrays if value.shape[0] == len(original) else info
+                    if np.iscomplexobj(value):
+                        target[key + '_real'], target[key + '_imag'] = value.real, value.imag
+                    else:
+                        target[key] = value
+                atoms_list.append(_prediction_atoms(original, info, arrays))
+
+        if xyz_output is not None:
+            write(xyz_output, atoms_list, format='extxyz')
+        return {key: np.concatenate(values, axis=0) if values else None
+                for key, values in collected.items()}
 
     def _add_atomic_energies(self, batch: torch_geometric.batch.Batch):
         e0_list = []
@@ -256,3 +174,36 @@ class EvaluateTask(nn.Module):
         for atomic_numbers in atomic_numbers_list:
             e0_list.append(sum(self.atomic_energies.get(Z, 0) for Z in atomic_numbers))
         return np.array(e0_list)
+
+
+def _prediction_atoms(original, info, arrays):
+    """Copy valid references, then replace only explicitly named predictions."""
+    atoms = original.copy()
+    references = {}
+    if original.calc is not None and not original.calc.check_state(original):
+        references = {key: np.array(value, copy=True) for key, value in
+                      original.calc.results.items() if key in all_properties and value is not None}
+    # Metadata has precedence over calculator storage, as in reference reads.
+    for key in all_properties:
+        location = atoms.arrays if key in ('forces', 'charges', 'magmoms', 'stresses', 'energies') else atoms.info
+        if key in location and location[key] is not None:
+            references[key] = np.array(location[key], copy=True)
+    for values, location in ((info, atoms.info), (arrays, atoms.arrays)):
+        for key, value in values.items():
+            if key in all_properties:
+                references[key] = value
+            elif location is atoms.arrays:
+                atoms.set_array(key, np.array(value, copy=True))
+            else:
+                location[key] = np.array(value, copy=True)
+    for key in references:
+        atoms.info.pop(key, None)
+        atoms.arrays.pop(key, None)
+    if ('energy' in info or 'forces' in arrays) and 'free_energy' not in info:
+        references.pop('free_energy', None)
+        atoms.info.pop('free_energy', None)
+    if 'stress' in references and np.shape(references['stress']) == (3, 3):
+        references['stress'] = full_3x3_to_voigt_6_stress(references['stress'])
+    if references:
+        atoms.calc = SinglePointCalculator(atoms, **references)
+    return atoms

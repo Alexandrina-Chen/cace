@@ -56,3 +56,6 @@ hypothesis/
 # Miscellaneous
 .DS_Store
 Thumbs.db
+# Local compatibility experiment outputs
+compat-results/
+.superpowers/

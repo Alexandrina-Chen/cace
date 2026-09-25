@@ -2,8 +2,6 @@ import torch
 import logging
 import ase.io
 import cace
-import pickle
-import os
 from cace.representations import Cace
 from cace.modules import PolynomialCutoff, BesselRBF, Atomwise, Forces
 from cace.models.atomistic import NeuralNetworkPotential
@@ -17,19 +15,11 @@ def main():
     setup_logger(level='INFO', tag=args.prefix, directory='./')
     device = init_device(args.use_device)
 
+    xyz = ase.io.read(args.train_path, ':')
     if args.zs is None:
-        xyz = ase.io.read(args.train_path, ':')
         args.zs = get_unique_atomic_number(xyz)
 
-# load the avge0 dict from a file if possible
-    if os.path.exists('avge0.pkl'):
-        with open('avge0.pkl', 'rb') as f:
-            avge0 = pickle.load(f)
-    else:
-        # Load Dataset
-        avge0 = compute_average_E0s(xyz)
-        with open('avge0.pkl', 'wb') as f:
-            pickle.dump(avge0, f)
+    avge0 = compute_average_E0s(xyz, zs=args.zs, energy_key=args.energy_key)
 
     # Prepare Data Loaders
     collection = cace.tasks.get_dataset_from_xyz(
@@ -119,4 +109,3 @@ def main():
 
 if __name__ == '__main__':
     main()
-

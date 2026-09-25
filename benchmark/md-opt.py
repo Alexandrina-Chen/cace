@@ -88,10 +88,10 @@ calculator = CACECalculator(
     compute_stress=False,
 )
 
-init_conf.set_calculator(calculator)
+init_conf.calc = calculator
 
 temperature = 300.0 
-MaxwellBoltzmannDistribution(init_conf, temperature * units.kB)
+MaxwellBoltzmannDistribution(init_conf, temperature_K=temperature)
 
 dyn = NPT(
     init_conf, 

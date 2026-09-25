@@ -10,13 +10,15 @@ from ase.stress import full_3x3_to_voigt_6_stress
 
 from ..tools import torch_geometric, torch_tools, to_numpy
 from ..data import AtomicData
+from ..modules import Forces, DirectForces
+from ..models import NeuralNetworkPotential, CombinePotential
  
 __all__ = ["CACECalculator"]
 
 class CACECalculator(Calculator):
     """CACE ASE Calculator
     args:
-        model_path: str or nn.module, path to model
+        model_path: str or nn.module, path to a trusted pickled model or model object
         device: str, device to run on (cuda or cpu)
         compute_stress: bool, whether to compute stress
         energy_key: str, key for energy in model output
@@ -52,8 +54,10 @@ class CACECalculator(Calculator):
         self.implemented_properties = [
             "energy",
             "forces",
-            "stress",
         ]
+
+        if compute_stress:
+            self.implemented_properties.append("stress")
 
         if charge_key is not None:
             self.implemented_properties.extend(
@@ -65,12 +69,14 @@ class CACECalculator(Calculator):
         self.results = {}
 
         if isinstance(model_path, str):
-            self.model = torch.load(f=model_path, map_location=device)
+            self.model = torch.load(f=model_path, map_location=device, weights_only=False)
         elif isinstance(model_path, torch.nn.Module):
             self.model = model_path
         else:
             raise ValueError("model_path must be a string or nn.Module")
         self.model.to(device)
+        if external_field is None and _conservative_energy(self.model, energy_key, forces_key):
+            self.implemented_properties.append("free_energy")
 
         self.device = torch_tools.init_device(device)
         self.energy_units_to_eV = energy_units_to_eV
@@ -120,11 +126,13 @@ class CACECalculator(Calculator):
         if not hasattr(self, "output_index"):
             self.output_index = None
 
+        # Atoms.copy() omits the attached calculator, avoiding recursive reads.
+        inference_atoms = atoms.copy()
         # prepare data
         data_loader = torch_geometric.dataloader.DataLoader(
             dataset=[
                 AtomicData.from_atoms(
-                    atoms, cutoff=self.cutoff,
+                    inference_atoms, cutoff=self.cutoff,
                     data_key=self.data_key,
                 )
             ],
@@ -171,9 +179,34 @@ class CACECalculator(Calculator):
 
         if self.charge_key is not None:
             charge_output = to_numpy(output[self.charge_key])
-            self.results["charges"] = charge_output * self.charge_unit
+            if charge_output.shape not in ((len(atoms),), (len(atoms), 1)):
+                raise ValueError("Charge output must contain one scalar per atom")
+            self.results["charges"] = charge_output.reshape(len(atoms)) * self.charge_unit
 
-        self.results["energy"] = float(np.asarray(self.results["energy"], dtype=np.float64))     # python float
+        self.results["energy"] = float(np.asarray(self.results["energy"], dtype=np.float64).item())     # python float
         self.results["forces"] = np.asarray(self.results["forces"], dtype=np.float64)            # (N,3) float64
 
+        if "free_energy" in self.implemented_properties:
+            self.results["free_energy"] = self.results["energy"]
+
         return self.results
+
+
+def _conservative_energy(model, energy_key, forces_key):
+    """Recognize native energy derivatives and their linear combinations."""
+    if isinstance(model, CombinePotential):
+        return (model.operation == model.default_operation and bool(model.models)
+                and all(energy_key in keys and forces_key in keys
+                        and _conservative_energy(child, keys[energy_key], keys[forces_key])
+                        for child, keys in zip(model.models, model.potential_keys)))
+    if not isinstance(model, NeuralNetworkPotential) or model.do_postprocessing:
+        return False
+    if any(isinstance(module, DirectForces) for module in model.modules()):
+        return False
+    # Later energy/force writers would invalidate the derivative relationship.
+    for module in reversed(model.output_modules):
+        outputs = getattr(module, 'model_outputs', ())
+        if energy_key in outputs or forces_key in outputs:
+            return (isinstance(module, Forces) and module.calc_forces
+                    and module.energy_key == energy_key and module.forces_key == forces_key)
+    return False

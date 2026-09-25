@@ -10,6 +10,7 @@ import torch
 
 from . import torch_geometric
 from .torch_tools import to_numpy
+from .stored_labels import read_stored_label
 
 class AtomicNumberTable:
     def __init__(self, zs: Sequence[int]):
@@ -91,7 +92,10 @@ def compute_average_E0s(
     A = np.zeros((len_xyz, len_zs))
     B = np.zeros(len_xyz)
     for i in range(len_xyz):
-        B[i] = atom_list[i].info[energy_key]
+        energy = read_stored_label(atom_list[i], energy_key)
+        if energy is None:
+            raise ValueError(f"Missing required energy label {energy_key!r} in frame {i}")
+        B[i] = energy
         for j, z in enumerate(zs):
             A[i, j] = np.count_nonzero(atom_list[i].get_atomic_numbers() == z)
     try:

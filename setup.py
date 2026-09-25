@@ -9,7 +9,7 @@ setup(
     packages=find_packages(),
     install_requires=[
         'numpy<2',
-        'ase<=3.22.1',
+        'ase>=3.22.1',
         'torch',
         'matscipy',
         # 'lightning', # Uncomment if needed

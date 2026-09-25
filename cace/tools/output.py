@@ -21,9 +21,12 @@ def batch_to_atoms(batched_data: Dict,
     - cace_energy_key (str): Key for accessing CACE energy information.
     - cace_forces_key (str): Key for accessing CACE force information.
     - output_file (str): Name of the output file to write the Atoms objects.
+
+    Original partial PBC is not stored in graphs; reconstruction retains the
+    legacy all-or-none PBC inference from the cell.
     """
 
-    if pred_data == None and energy_key != cace_energy_key:
+    if pred_data is None:
         pred_data = batched_data
     atoms_list = []
     batch = batched_data.batch
@@ -38,20 +41,19 @@ def batch_to_atoms(batched_data: Dict,
         atomic_numbers = to_numpy(batched_data['atomic_numbers'][mask])
         cell = to_numpy(batched_data['cell'][3*i:3*i+3])
 
-        energy = to_numpy(batched_data[energy_key][i])
-        forces = to_numpy(batched_data[forces_key][mask])
-        cace_energy = to_numpy(pred_data[cace_energy_key][i])
-        cace_forces = to_numpy(pred_data[cace_forces_key][mask])
-
         # Set periodic boundary conditions if the cell is defined
         pbc = np.all(np.mean(cell, axis=0) > 0)
 
         # Create the Atoms object
         atoms = ase.Atoms(numbers=atomic_numbers, positions=positions, cell=cell, pbc=pbc)
-        atoms.info[energy_key] = energy.item() if np.ndim(energy) == 0 else energy
-        atoms.arrays[forces_key] = forces
-        atoms.info[cace_energy_key] = cace_energy.item() if np.ndim(cace_energy) == 0 else cace_energy
-        atoms.arrays[cace_forces_key] = cace_forces
+        for source, ekey, fkey in ((batched_data, energy_key, forces_key),
+                                   (pred_data, cace_energy_key, cace_forces_key)):
+            source = source if isinstance(source, dict) else source.to_dict()
+            if source.get(ekey) is not None:
+                energy = to_numpy(source[ekey][i])
+                atoms.info[ekey] = energy.item() if np.ndim(energy) == 0 else energy
+            if source.get(fkey) is not None:
+                atoms.arrays[fkey] = to_numpy(source[fkey][mask]).copy()
         atoms_list.append(atoms)
 
     # Write all atoms to the output file

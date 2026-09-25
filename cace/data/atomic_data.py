@@ -12,6 +12,7 @@ from ..tools import torch_geometric
 import torch.nn as nn
 import torch.utils.data
 from ..tools import voigt_to_matrix
+from ..tools.stored_labels import read_stored_label
 
 from .neighborhood import get_neighborhood
 
@@ -119,9 +120,7 @@ class AtomicData(torch_geometric.data.Data):
         data_key: Dict[str, str] = None,
         atomic_energies: Optional[Dict[int, float]] = None,
     ) -> "AtomicData":
-        if data_key is not None:
-            data_key = default_data_key.update(data_key)
-        data_key = default_data_key
+        data_key = {**default_data_key, **(data_key or {})}
         positions = atoms.get_positions()
         pbc = tuple(atoms.get_pbc())
         cell = np.array(atoms.get_cell())
@@ -134,28 +133,17 @@ class AtomicData(torch_geometric.data.Data):
             cell=cell
         )
 
-        # this ugly bit is for compatibility with newest ASE versions
-        energy = atoms.info.get(data_key["energy"], None)  # eV
-        if energy is None and data_key['energy'] == 'energy':
-            try:
-                energy = atoms.get_potential_energy()
-            except:
-                energy = None
+        energy = read_stored_label(atoms, data_key["energy"])  # eV
 
         # subtract atomic energies if available
         if atomic_energies and energy is not None:
             energy -= sum(atomic_energies.get(Z, 0) for Z in atomic_numbers)
 
-        forces = atoms.arrays.get(data_key["forces"], None)  # eV / Ang
-        if forces is None and data_key['forces'] == 'forces':
-            try:
-                forces = atoms.get_forces()
-            except:
-                forces = None
+        forces = read_stored_label(atoms, data_key["forces"], locations=("arrays",))  # eV / Ang
 
-        molecular_index = atoms.arrays.get(data_key["molecular_index"], None) # index of molecules
-        stress = atoms.info.get(data_key["stress"], None)  # eV / Ang
-        virials = atoms.info.get(data_key["virials"], None)
+        molecular_index = read_stored_label(atoms, data_key["molecular_index"], locations=("arrays",))
+        stress = read_stored_label(atoms, data_key["stress"])
+        virials = read_stored_label(atoms, data_key["virials"])
 
         # process these to make tensors
         cell = (
@@ -203,9 +191,7 @@ class AtomicData(torch_geometric.data.Data):
             if kk is None or key in ['energy', 'forces', 'stress', 'virials', 'molecular_index']:
                 continue
             else:
-                more_info = atoms.info.get(kk, None)
-                if more_info is None:
-                    more_info = atoms.arrays.get(kk, None)
+                more_info = read_stored_label(atoms, kk, locations=("info", "arrays"))
                 more_info = (
                     torch.tensor(more_info, dtype=torch.get_default_dtype())
                     if more_info is not None
