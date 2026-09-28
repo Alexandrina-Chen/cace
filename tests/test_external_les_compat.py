@@ -55,13 +55,18 @@ def test_fresh_model_optimizer_and_roundtrip(long_range, dtype, tmp_path):
     path = tmp_path/'model.pt'
     torch.save(m, path)
     expected = EvaluateTask(copy.deepcopy(m), device=DEVICE)(a, compute_stress=True)
-    actual = EvaluateTask(str(path), device=DEVICE)(a, compute_stress=True)
+    restored = EvaluateTask(str(path), device=DEVICE)
+    torch.testing.assert_close(restored.model.state_dict(), m.state_dict(), rtol=0, atol=0)
+    actual = restored(a, compute_stress=True)
+    # Float32 epsilon is ~1.19e-7: allow a few rounding units in separate
+    # evaluations, with a small absolute floor near zero. Saved state is exact.
+    rtol, atol = (1e-6, 1e-8) if dtype == torch.float32 else (1e-12, 1e-12)
     for k in ('energy','forces','stress'):
-        np.testing.assert_allclose(actual[k], expected[k], rtol=1e-12, atol=1e-12)
+        np.testing.assert_allclose(actual[k], expected[k], rtol=rtol, atol=atol)
     a.calc = CACECalculator(str(path), DEVICE, compute_stress=True)
-    np.testing.assert_allclose(a.get_potential_energy(force_consistent=True), expected['energy'][0], rtol=1e-12)
-    np.testing.assert_allclose(a.get_forces(), expected['forces'], rtol=1e-12, atol=1e-12)
-    np.testing.assert_allclose(a.get_stress(voigt=False), expected['stress'][0], rtol=1e-12, atol=1e-12)
+    np.testing.assert_allclose(a.get_potential_energy(force_consistent=True), expected['energy'][0], rtol=rtol, atol=atol)
+    np.testing.assert_allclose(a.get_forces(), expected['forces'], rtol=rtol, atol=atol)
+    np.testing.assert_allclose(a.get_stress(voigt=False), expected['stress'][0], rtol=rtol, atol=atol)
 
 
 def test_external_force_stress_central_differences():

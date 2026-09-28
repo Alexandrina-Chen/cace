@@ -58,14 +58,14 @@ CACE_TEST_DEVICE=cuda OMP_NUM_THREADS=1 python -m pytest -q tests/test_external_
 
 ## Results and limits
 
-| Check | CPU result |
+| Check | Result |
 | --- | --- |
 | ASE 3.22.1 focused suite | 42 passed |
 | ASE 3.29.0 suite, including modern MD | 46 passed; four expected velocity-initialization deprecation warnings |
 | Final ASE 3.29.0 dependency check | No broken requirements |
 | Fresh CACE and scalar external LES | Float32/float64 finite E/F/S, SR+LR addition, optimizer coverage, finite gradients, external-head update and calculator/evaluator save/load passed |
 | Float64 external LES derivatives | All 15 force and 6 symmetric-strain components passed central differences |
-| CUDA execution | Not yet validated |
+| CUDA execution | 11 passed in 191.93 s with dtype-specific round-trip tolerances; one disabled kernel-cache warning and four velocity-initialization deprecation warnings |
 
 Synthetic H/B/C/N/F tests use a 6-A cutoff, six trainable Bessel functions,
 mixed radial width 12, embedding width 4, `max_l=max_nu=3`, one Bchi step
@@ -74,6 +74,15 @@ lazy heads are materialized on the target device before optimizer creation.
 The unchanged wrapper uses the default scalar external head `[32,16]`,
 scaling 0.1, legacy Ewald backend, `sigma=1`, `dl=2` and self removal.
 Descriptor-list, supplied-charge and optional response forwarding are tested.
+
+Round-trip evaluator/calculator E/F/S comparisons use `rtol=1e-6, atol=1e-8`
+for float32 and `rtol=atol=1e-12` for float64. Float32 machine epsilon is
+approximately `1.19e-7`; the relative tolerance allows several rounding units
+across separate evaluations, with a small absolute floor near zero in native
+units. Saved parameters and buffers must still reload exactly. The initial
+CUDA failures had maximum force differences of `7.45e-9` (about `1e-7`
+relative). The successful rerun reached all float32 stress and calculator
+comparisons, as well as exact saved-state checks for both dtypes and models.
 
 Central differences use step `1e-5`; force tolerances are
 `rtol=2e-5, atol=2e-7`, and stress tolerances `rtol=2e-5, atol=2e-8`.
